@@ -1,0 +1,518 @@
+# Troubleshooting AWS ALB 504 Gateway Timeout in Production
+
+## Introduction
+
+An HTTP 504 Gateway Timeout from an Application Load Balancer does not automatically mean that the Application Load Balancer is broken.
+
+In production environments, a 504 can be caused by several layers of the request path:
+
+```text
+Client
+   |
+   v
+CloudFront
+   |
+   v
+Application Load Balancer
+   |
+   v
+EC2
+   |
+   v
+Apache
+   |
+   v
+PHP-FPM
+   |
+   v
+Application
+```
+
+This case study demonstrates a structured approach to investigating an ALB 504 issue affecting a production application.
+
+> All customer-specific information has been removed or generalized.
+
+---
+
+## Incident Symptom
+
+The application was intermittently returning:
+
+```text
+HTTP 504 Gateway Timeout
+```
+
+The environment contained multiple EC2 instances behind an Application Load Balancer.
+
+The initial observation was unusual:
+
+* EC2 CPU utilization was very low
+* EC2 status checks were passing
+* EBS queue length was normal
+* One application instance was behaving differently from the other instances
+* The ALB was reporting the affected target as unhealthy
+* Application logs showed PHP-FPM/proxy-related errors
+
+This is an important lesson:
+
+**Low CPU does not mean the application is healthy.**
+
+---
+
+## Step 1 — Confirm the ALB Symptoms
+
+The first step was to determine whether the timeout originated between the ALB and the backend application.
+
+Useful ALB metrics include:
+
+```text
+HTTPCode_ELB_5XX_Count
+HTTPCode_Target_5XX_Count
+TargetResponseTime
+HealthyHostCount
+UnHealthyHostCount
+RequestCount
+```
+
+The goal is to determine:
+
+```text
+ALB problem?
+       |
+       +-- ELB-generated 5xx
+       |
+       +-- Target-generated 5xx
+       |
+       +-- Target timeout
+```
+
+A 504 should therefore be investigated as a request-path problem rather than immediately assuming an ALB configuration issue.
+
+---
+
+## Step 2 — Check Target Health
+
+Next, check the target group.
+
+Important questions:
+
+* Is the target healthy?
+* What health-check path is configured?
+* What response code is expected?
+* Is the health-check endpoint responding quickly?
+* Is the application server accepting connections?
+
+A healthy EC2 instance does not necessarily mean a healthy application.
+
+The AWS infrastructure can report:
+
+```text
+EC2 = healthy
+```
+
+while the application is:
+
+```text
+Application = unhealthy
+```
+
+---
+
+## Step 3 — Check EC2 Health
+
+The next step was to inspect the affected EC2 instance.
+
+Check:
+
+```bash
+top
+```
+
+```bash
+free -m
+```
+
+```bash
+df -h
+```
+
+```bash
+iostat
+```
+
+Also inspect:
+
+```text
+EC2 Status Checks
+CPUUtilization
+EBS metrics
+Network metrics
+System logs
+Application logs
+```
+
+In this incident, the EC2 infrastructure itself did not show obvious resource exhaustion.
+
+That eliminated several common infrastructure-level causes.
+
+---
+
+## Step 4 — Investigate Apache and PHP-FPM
+
+Because the application was running behind Apache and PHP-FPM, the next layer was the application runtime.
+
+Check the PHP-FPM service:
+
+```bash
+systemctl status php-fpm
+```
+
+Check the logs:
+
+```bash
+journalctl -u php-fpm
+```
+
+Depending on the OS and PHP version, application logs may also be located under:
+
+```text
+/var/log/
+```
+
+Apache logs should also be inspected:
+
+```bash
+tail -f /var/log/httpd/error_log
+```
+
+Look for errors involving:
+
+```text
+proxy_fcgi
+timeout
+connection reset
+max children
+server reached
+upstream
+```
+
+One of the important observations in this incident was excessive PHP-FPM worker activity.
+
+This demonstrated why application-layer metrics are important even when EC2-level metrics appear normal.
+
+---
+
+## Step 5 — Review PHP-FPM Configuration
+
+The PHP-FPM process manager configuration was reviewed.
+
+Important parameters include:
+
+```ini
+pm = dynamic
+pm.max_children
+pm.start_servers
+pm.min_spare_servers
+pm.max_spare_servers
+```
+
+The configuration was adjusted based on the application's workload and available instance resources.
+
+After making the configuration change, PHP-FPM was restarted:
+
+```bash
+systemctl restart php-fpm
+```
+
+The service status was then verified:
+
+```bash
+systemctl status php-fpm
+```
+
+---
+
+## Step 6 — Validate the Health Endpoint
+
+A dedicated health endpoint was introduced:
+
+```text
+/health.html
+```
+
+The purpose of a simple health endpoint is to determine whether the web server can respond without requiring the full application stack.
+
+For example:
+
+```bash
+curl -I http://localhost/health.html
+```
+
+If this succeeds but the application endpoint fails, the troubleshooting scope becomes much narrower.
+
+---
+
+## Step 7 — Investigate Auto Scaling Configuration
+
+The issue also highlighted the importance of configuration consistency across Auto Scaling instances.
+
+If an Auto Scaling Group launches instances from an outdated Launch Template or AMI, a newly launched instance may reproduce the same configuration problem.
+
+The remediation process included:
+
+```text
+Fix configuration
+      |
+      v
+Validate instance
+      |
+      v
+Create Golden AMI
+      |
+      v
+Update Launch Template
+      |
+      v
+Update Auto Scaling Group
+      |
+      v
+Launch replacement instance
+      |
+      v
+Validate ALB target health
+```
+
+This is preferable to manually fixing individual instances and allowing configuration drift to return later.
+
+---
+
+## Step 8 — Validate CloudFront Behavior
+
+When CloudFront is present in front of the ALB, caching and behavior configuration should also be considered.
+
+Check:
+
+* Cache behavior
+* Origin configuration
+* Origin protocol
+* Allowed methods
+* Cache policy
+* Origin request policy
+* TTL
+* Recent configuration changes
+
+If required, invalidate cached objects after correcting the underlying issue.
+
+Example:
+
+```text
+CloudFront
+     |
+     v
+ALB
+     |
+     v
+EC2
+     |
+     v
+Application
+```
+
+Every layer needs to be considered when debugging the complete request path.
+
+---
+
+## Step 9 — Scale Out to Isolate the Problem
+
+An additional EC2 instance was introduced through the Auto Scaling Group to help determine whether the problem was:
+
+* instance-specific
+* application-specific
+* availability-zone related
+* configuration-related
+* load-related
+
+This is a useful production troubleshooting technique:
+
+**Change one variable and observe the result.**
+
+Adding capacity can also help determine whether the problem follows the workload or remains isolated to a particular instance.
+
+---
+
+## Root Cause Investigation
+
+The investigation showed that the issue was not simply an AWS infrastructure failure.
+
+The investigation crossed multiple layers:
+
+```text
+ALB
+ |
+ +-- Target health
+ |
+ +-- EC2
+      |
+      +-- Apache
+      |
+      +-- PHP-FPM
+           |
+           +-- Worker/process configuration
+                |
+                +-- Application response
+```
+
+The key lesson was that AWS infrastructure metrics alone were insufficient to identify the application bottleneck.
+
+---
+
+## Remediation
+
+The remediation included:
+
+* Reviewing PHP-FPM worker configuration
+* Restarting and validating PHP-FPM
+* Introducing a simple health endpoint
+* Validating ALB target health
+* Reviewing Auto Scaling configuration
+* Creating a corrected Golden AMI
+* Updating the Launch Template
+* Validating replacement instances
+* Reviewing CloudFront behavior
+* Monitoring the application after the changes
+
+---
+
+## Prevention
+
+The long-term improvements are more important than the immediate fix.
+
+Recommended controls include:
+
+### 1. Application health checks
+
+Use lightweight health endpoints for infrastructure health checks.
+
+### 2. Golden AMIs
+
+Keep production instances consistent.
+
+### 3. Immutable infrastructure
+
+Prefer replacing incorrectly configured instances over repeatedly modifying individual servers.
+
+### 4. Application-level monitoring
+
+Monitor:
+
+* PHP-FPM workers
+* Request latency
+* Application errors
+* Apache errors
+* ALB target response time
+
+### 5. Centralized logging
+
+Send application and infrastructure logs to a centralized logging platform.
+
+### 6. Alerting
+
+Create alerts around:
+
+```text
+UnhealthyHostCount
+TargetResponseTime
+HTTP 5xx
+Application errors
+PHP-FPM saturation
+```
+
+---
+
+## Troubleshooting Checklist
+
+When investigating an ALB 504:
+
+```text
+[ ] Confirm the affected URL
+[ ] Check ALB metrics
+[ ] Check target health
+[ ] Check target response time
+[ ] Check EC2 status checks
+[ ] Check CPU/memory/disk
+[ ] Check Apache logs
+[ ] Check PHP-FPM logs
+[ ] Check PHP-FPM worker utilization
+[ ] Test the application locally
+[ ] Test the health endpoint
+[ ] Check recent infrastructure changes
+[ ] Check Launch Template version
+[ ] Check Auto Scaling configuration
+[ ] Check CloudFront configuration
+[ ] Validate the remediation
+[ ] Monitor after the fix
+```
+
+---
+
+## Key Lessons
+
+### Lesson 1
+
+**EC2 health does not equal application health.**
+
+### Lesson 2
+
+**A 504 is a symptom, not a root cause.**
+
+### Lesson 3
+
+**Troubleshoot from the client toward the application layer.**
+
+### Lesson 4
+
+**Use evidence before changing configuration.**
+
+### Lesson 5
+
+**Fix configuration drift at the source instead of repeatedly fixing individual instances.**
+
+### Lesson 6
+
+**Production troubleshooting should end with prevention, not just recovery.**
+
+---
+
+## Conclusion
+
+AWS production incidents rarely belong to a single service.
+
+A seemingly simple ALB 504 can require investigation across:
+
+```text
+CloudFront
+   ↓
+ALB
+   ↓
+Target Group
+   ↓
+EC2
+   ↓
+Apache
+   ↓
+PHP-FPM
+   ↓
+Application
+```
+
+The most effective troubleshooting approach is therefore systematic:
+
+**Observe → Isolate → Investigate → Remediate → Validate → Prevent**
+
+This repository documents that approach using practical AWS production troubleshooting scenarios.
+
+---
+
+## Disclaimer
+
+This case study is an educational reconstruction based on real-world cloud engineering troubleshooting patterns. Customer names, account information, IP addresses, credentials, proprietary configurations, and other sensitive information have intentionally been excluded.
